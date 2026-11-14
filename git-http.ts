@@ -25,6 +25,68 @@ export interface GitResponse {
 
 const AGENT = 'github-core-forge/1.0';
 
+// ---------------------------------------------------------------------------
+// Response caches (pure functions of immutable data — safe to reuse).
+//
+// Fetch responses: for a request with no haves, the pack sent is fully
+// determined by the wanted oids + depth + filter + shallow lines, because
+// git objects are content-addressed and immutable: a want's closure can
+// never grow after the fact (new objects are descendants, never
+// ancestors, of a wanted commit). So a response cached once is valid
+// forever. Only cached when every want exists in the store at fill time.
+// Advertisements: cached per repo+service while the ref fingerprint
+// (default branch + ref names/oids) is unchanged; skipped entirely when
+// the repo holds tag refs, whose peeled lines depend on object presence.
+// Both caches are bounded (FIFO eviction) so a long trial cannot grow
+// them without limit.
+// ---------------------------------------------------------------------------
+
+const FETCH_CACHE_MAX = 512;
+const fetchCache = new Map<string, Buffer>();
+function fetchCacheGet(key: string): Buffer | undefined {
+  // Plain get: insertion-order FIFO eviction is fine — a hot key is
+  // re-added if it ever gets evicted, and a trial holds few distinct
+  // fetch shapes. (No recency refresh: it costs a delete+set per hit.)
+  return fetchCache.get(key);
+}
+function fetchCachePut(key: string, buf: Buffer): void {
+  if (fetchCache.has(key)) fetchCache.delete(key);
+  fetchCache.set(key, buf);
+  while (fetchCache.size > FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next();
+    if (oldest.done) break;
+    fetchCache.delete(oldest.value);
+  }
+}
+
+const ADV_CACHE_MAX = 256;
+interface AdvEntry { fp: string; buf: Buffer; }
+const advCache = new Map<string, AdvEntry>();
+function advFingerprint(repo: Repo): string | null {
+  let hasTag = false;
+  const parts: string[] = [repo.defaultBranch];
+  for (const [name, oid] of repo.refs) {
+    if (name.startsWith('refs/tags/')) hasTag = true;
+    parts.push(`${name}=${oid}`);
+  }
+  if (hasTag) return null;
+  return parts.join('|');
+}
+function advCacheGet(key: string, fp: string): Buffer | undefined {
+  const hit = advCache.get(key);
+  if (hit !== undefined && hit.fp === fp) return hit.buf;
+  return undefined;
+}
+function advCachePut(key: string, fp: string, buf: Buffer): void {
+  if (advCache.has(key)) advCache.delete(key);
+  advCache.set(key, { fp, buf });
+  while (advCache.size > ADV_CACHE_MAX) {
+    const oldest = advCache.keys().next();
+    if (oldest.done) break;
+    advCache.delete(oldest.value);
+  }
+}
+
 function ok(body: Buffer, contentType: string): GitResponse {
   return { status: 200, contentType, body };
 }
@@ -102,11 +164,37 @@ export function handleInfoRefs(store: Store, repo: Repo | undefined, service: st
   if (!repo) return notFound();
   if (service === 'git-upload-pack') {
     const wantsV2 = (headers['git-protocol'] ?? '').includes('version=2');
-    if (wantsV2) return ok(v2Advertisement(), 'application/x-git-upload-pack-advertisement');
-    return ok(v0Advertisement(store, repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+    if (wantsV2) {
+      const fp = advFingerprint(repo);
+      const key = `${repo.owner}/${repo.name}|up2`;
+      if (fp !== null) {
+        const hit = advCacheGet(key, fp);
+        if (hit !== undefined) return ok(hit, 'application/x-git-upload-pack-advertisement');
+      }
+      const buf = v2Advertisement();
+      if (fp !== null) advCachePut(key, fp, buf);
+      return ok(buf, 'application/x-git-upload-pack-advertisement');
+    }
+    const fp = advFingerprint(repo);
+    const key = `${repo.owner}/${repo.name}|up0`;
+    if (fp !== null) {
+      const hit = advCacheGet(key, fp);
+      if (hit !== undefined) return ok(hit, 'application/x-git-upload-pack-advertisement');
+    }
+    const buf = v0Advertisement(store, repo, 'git-upload-pack');
+    if (fp !== null) advCachePut(key, fp, buf);
+    return ok(buf, 'application/x-git-upload-pack-advertisement');
   }
   if (service === 'git-receive-pack') {
-    return ok(v0Advertisement(store, repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+    const fp = advFingerprint(repo);
+    const key = `${repo.owner}/${repo.name}|rp0`;
+    if (fp !== null) {
+      const hit = advCacheGet(key, fp);
+      if (hit !== undefined) return ok(hit, 'application/x-git-receive-pack-advertisement');
+    }
+    const buf = v0Advertisement(store, repo, 'git-receive-pack');
+    if (fp !== null) advCachePut(key, fp, buf);
+    return ok(buf, 'application/x-git-receive-pack-advertisement');
   }
   return notFound();
 }
@@ -160,6 +248,13 @@ function splitV2Request(packets: ReturnType<typeof decodePktLines>): { command: 
 }
 
 function fetchResponseV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const cacheKey = args.haves.length === 0 && args.wants.every((w) => store.objects.has(w))
+    ? `v2|${args.wants.join(',')}|${args.depth ?? ''}|${args.filter ?? ''}|${args.shallow.join(',')}`
+    : null;
+  if (cacheKey !== null) {
+    const hit = fetchCacheGet(cacheKey);
+    if (hit !== undefined) return hit;
+  }
   const { objects, shallow, unshallow } = fetchSet(store.objects, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   // acknowledgments
@@ -183,7 +278,9 @@ function fetchResponseV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(writePack(objects)));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (cacheKey !== null) fetchCachePut(cacheKey, out);
+  return out;
 }
 
 function parseFetchArgsV2(args: string[]): FetchArgs {
@@ -221,6 +318,13 @@ function parseFetchArgsV0(lines: string[]): FetchArgs {
 }
 
 function fetchResponseV0(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const cacheKey = args.haves.length === 0 && args.wants.every((w) => store.objects.has(w))
+    ? `v0|${args.wants.join(',')}|${args.depth ?? ''}|${args.shallow.join(',')}`
+    : null;
+  if (cacheKey !== null) {
+    const hit = fetchCacheGet(cacheKey);
+    if (hit !== undefined) return hit;
+  }
   const { objects, shallow, unshallow } = fetchSet(store.objects, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   const acked = args.haves.filter((h) => store.objects.has(h));
@@ -233,7 +337,9 @@ function fetchResponseV0(store: Store, repo: Repo, args: FetchArgs): Buffer {
   for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   parts.push(sidebandPack(writePack(objects)));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (cacheKey !== null) fetchCachePut(cacheKey, out);
+  return out;
 }
 
 /** POST /{owner}/{repo}.git/git-upload-pack */
@@ -302,7 +408,7 @@ export function handleReceivePack(store: Store, repo: Repo | undefined, req: Git
   if (packBytes.length > 0) {
     try {
       const objects = readPack(packBytes, store.objects);
-      for (const [, obj] of objects) store.objects.put(obj.type, obj.data);
+      for (const [oid, obj] of objects) store.objects.putKnown(obj.type, obj.data, oid);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpacker error';

@@ -60,6 +60,8 @@ export interface Issue {
   id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; labels: Label[]; comments: Comment[];
   createdAt: string; updatedAt: string; createdSeq: number;
+  /** Precomputed REST node_id (base64url of "I:<owner>/<repo>:<number>"); immutable. */
+  nodeId: string;
 }
 export interface PullRequest {
   id: number; number: number; title: string; body: string;
@@ -335,12 +337,14 @@ export class Store {
 
   createIssue(repo: Repo, title: string, body: string, labels: Label[]): Issue {
     const n = nextSeq();
+    const number = repo.nextNumber++;
     const issue: Issue = {
       id: this.nextIssueId++,
-      number: repo.nextNumber++,
+      number,
       title, body: body ?? '',
       state: 'open', labels, comments: [],
       createdAt: stamp(n), updatedAt: stamp(n), createdSeq: n,
+      nodeId: Buffer.from(`I:${repo.owner}/${repo.name}:${number}`, 'utf8').toString('base64url'),
     };
     repo.issues.push(issue);
     return issue;

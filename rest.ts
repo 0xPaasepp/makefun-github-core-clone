@@ -69,10 +69,10 @@ export function repoNodeId(repo: Repo): string {
   return Buffer.from(`R:${repo.owner}/${repo.name}`, 'utf8').toString('base64url');
 }
 
-function issueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: Label[]; comments: { id: number }[]; createdAt: string; updatedAt: string }): Json {
+function issueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: Label[]; comments: { id: number }[]; createdAt: string; updatedAt: string; nodeId: string }): Json {
   return {
     id: issue.id,
-    node_id: Buffer.from(`I:${repo.owner}/${repo.name}:${issue.number}`, 'utf8').toString('base64url'),
+    node_id: issue.nodeId,
     number: issue.number,
     title: issue.title,
     body: issue.body,

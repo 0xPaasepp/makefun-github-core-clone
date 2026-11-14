@@ -194,6 +194,42 @@ export function createApp(): Server {
             body = parsed.value;
           }
         }
+        // Fast path for the two hottest routes (the bench's read/write):
+        // exact segment shapes on the raw path, no regex table walk.
+        // The shapes are strict (digit-only issue number, exact segment
+        // counts), so anything unusual falls through to the table below
+        // and behaves exactly as before. These handlers never read the
+        // query string, so an empty URLSearchParams is equivalent.
+        const rawUrl = req.url ?? '/';
+        const qi = rawUrl.indexOf('?');
+        const rawPath = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+        if (rawPath.startsWith('/api/v3/repos/')) {
+          const seg = rawPath.split('/');
+          if (seg.length === 8 && seg[6] === 'issues' && method === 'GET' && /^\d+$/.test(seg[7])) {
+            const ctx: rest.RestContext = {
+              store,
+              params: { owner: seg[4], repo: seg[5], number: seg[7] },
+              query: new URLSearchParams(),
+              body,
+              origin: `http://${header(req, 'host') ?? '127.0.0.1'}`,
+            };
+            const out = rest.handleGetIssue(ctx);
+            sendJson(res, out.status, out.body, out.headers);
+            return;
+          }
+          if (seg.length === 7 && seg[6] === 'issues' && method === 'POST') {
+            const ctx: rest.RestContext = {
+              store,
+              params: { owner: seg[4], repo: seg[5] },
+              query: new URLSearchParams(),
+              body,
+              origin: `http://${header(req, 'host') ?? '127.0.0.1'}`,
+            };
+            const out = rest.handleCreateIssue(ctx);
+            sendJson(res, out.status, out.body, out.headers);
+            return;
+          }
+        }
         for (const route of routes) {
           if (route.method !== method) continue;
           const m = route.pattern.exec(path);

@@ -37,6 +37,12 @@ export class ObjectStore {
     return oid;
   }
 
+  /** Store an object whose oid is already known (skips re-hashing). */
+  putKnown(type: GitObjectType, data: Buffer, oid: string): string {
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    return oid;
+  }
+
   get(oid: string): GitObject | undefined {
     return this.objects.get(oid);
   }
