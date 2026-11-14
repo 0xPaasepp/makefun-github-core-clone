@@ -402,6 +402,14 @@ export function handleUploadPack(store: Store, repo: Repo | undefined, req: GitR
 
 interface PushCommand { oldOid: string; newOid: string; ref: string; }
 
+/** One hex digit's value, or -1 when the byte is not a hex digit. */
+function hexVal(b: number): number {
+  if (b >= 48 && b <= 57) return b - 48;
+  if (b >= 97 && b <= 102) return b - 87;
+  if (b >= 65 && b <= 70) return b - 55;
+  return -1;
+}
+
 export function handleReceivePack(store: Store, repo: Repo | undefined, req: GitRequest): GitResponse {
   if (!repo) return notFound();
   // Split the command list (pkt-lines up to the first flush) from the pack.
@@ -411,19 +419,27 @@ export function handleReceivePack(store: Store, repo: Repo | undefined, req: Git
   try {
     while (off < req.body.length) {
       if (off + 4 > req.body.length) throw new Error('truncated pkt-line');
-      const head = req.body.subarray(off, off + 4).toString('ascii');
-      if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('invalid pkt-line header');
-      const len = parseInt(head, 16);
+      const d0 = hexVal(req.body[off]);
+      const d1 = hexVal(req.body[off + 1]);
+      const d2 = hexVal(req.body[off + 2]);
+      const d3 = hexVal(req.body[off + 3]);
+      if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0) throw new Error('invalid pkt-line header');
+      const len = (d0 << 12) | (d1 << 8) | (d2 << 4) | d3;
       if (len === 0) { off += 4; packStart = off; break; }
       if (len < 4 || off + len > req.body.length) throw new Error('truncated pkt-line');
       const payload = req.body.subarray(off + 4, off + len).toString('utf8');
       off += len;
-      const line = payload.replace(/\n$/, '');
+      const line = payload.endsWith('\n') ? payload.slice(0, -1) : payload;
       const nul = line.indexOf('\0');
       const clean = nul >= 0 ? line.slice(0, nul) : line;
-      const parts = clean.split(' ');
-      if (parts.length >= 3 && isOid(parts[0]) && isOid(parts[1])) {
-        commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts.slice(2).join(' ') });
+      const sp1 = clean.indexOf(' ');
+      const sp2 = sp1 < 0 ? -1 : clean.indexOf(' ', sp1 + 1);
+      if (sp1 > 0 && sp2 > sp1 + 1) {
+        const oldOid = clean.slice(0, sp1);
+        const newOid = clean.slice(sp1 + 1, sp2);
+        if (isOid(oldOid) && isOid(newOid)) {
+          commands.push({ oldOid, newOid, ref: clean.slice(sp2 + 1) });
+        }
       }
     }
   } catch {
@@ -482,8 +498,21 @@ export function handleReceivePack(store: Store, repo: Repo | undefined, req: Git
     reportLines.push(reason === null ? `ok ${cmd.ref}\n` : `ng ${cmd.ref} ${reason}\n`);
   }
 
-  const report = Buffer.concat(reportLines.map((l) => pktLine(l)));
-  const body = Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), pktFlush()]);
+  // Report: one side-band band-1 pkt-line carrying the pkt-line framed
+  // report lines, then a flush — built into a single pre-sized Buffer
+  // instead of a chain of Buffer.concats.
+  let innerLen = 0;
+  for (const l of reportLines) innerLen += 4 + Buffer.byteLength(l);
+  const body = Buffer.allocUnsafe(4 + 1 + innerLen + 4);
+  let p = 0;
+  body.write((1 + innerLen + 4).toString(16).padStart(4, '0'), p, 4, 'ascii'); p += 4;
+  body[p] = 1; p += 1;
+  for (const l of reportLines) {
+    const n = Buffer.byteLength(l);
+    body.write((n + 4).toString(16).padStart(4, '0'), p, 4, 'ascii'); p += 4;
+    body.write(l, p, n, 'utf8'); p += n;
+  }
+  body.write('0000', p, 4, 'ascii');
   return ok(body, 'application/x-git-receive-pack-result');
 }
 export type { GitObject };

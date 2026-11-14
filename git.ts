@@ -18,13 +18,21 @@ const CODE_TYPE: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'b
 
 export function hashObject(type: GitObjectType, data: Buffer): string {
   const h = createHash('sha1');
-  h.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  h.update(`${type} ${data.length}\0`, 'utf8');
   h.update(data);
   return h.digest('hex');
 }
 
 export function isOid(v: string): boolean {
-  return /^[0-9a-f]{40}$/.test(v);
+  if (v.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const c = v.charCodeAt(i);
+    const digit = c >= 48 && c <= 57;
+    const lower = c >= 97 && c <= 102;
+    const upper = c >= 65 && c <= 70;
+    if (!digit && !lower && !upper) return false;
+  }
+  return true;
 }
 
 /** The shared object store: every object every repository holds. */
@@ -209,15 +217,27 @@ export const pktDelim = (): Buffer => Buffer.from('0001', 'ascii');
 
 export interface PktPacket { readonly kind: 'data' | 'flush' | 'delim' | 'response-end'; readonly payload?: Buffer; }
 
+/** One hex digit's value, or -1 when the byte is not a hex digit. */
+function hexVal(b: number): number {
+  if (b >= 48 && b <= 57) return b - 48;
+  if (b >= 97 && b <= 102) return b - 87;
+  if (b >= 65 && b <= 70) return b - 55;
+  return -1;
+}
+
 /** Decode a whole buffer into pkt-line packets; throws on malformed framing. */
 export function decodePktLines(buf: Buffer): PktPacket[] {
   const packets: PktPacket[] = [];
   let off = 0;
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line');
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error(`invalid pkt-line header ${JSON.stringify(head)}`);
-    const len = parseInt(head, 16);
+    // Header is 4 hex digits; parsed by hand (no regex, no substring).
+    const d0 = hexVal(buf[off]);
+    const d1 = hexVal(buf[off + 1]);
+    const d2 = hexVal(buf[off + 2]);
+    const d3 = hexVal(buf[off + 3]);
+    if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0) throw new Error('invalid pkt-line header');
+    const len = (d0 << 12) | (d1 << 8) | (d2 << 4) | d3;
     if (len === 0) { packets.push({ kind: 'flush' }); off += 4; continue; }
     if (len === 1) { packets.push({ kind: 'delim' }); off += 4; continue; }
     if (len === 2) { packets.push({ kind: 'response-end' }); off += 4; continue; }
