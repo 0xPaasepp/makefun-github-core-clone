@@ -29,6 +29,8 @@ export interface RestResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialized JSON payload (takes precedence over `body` when set). */
+  raw?: Buffer;
 }
 
 let requestCounter = 0;
@@ -86,6 +88,13 @@ function issueJson(repo: Repo, issue: { id: number; number: number; title: strin
     comments_url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
     comments: issue.comments.length,
   };
+}
+
+/** Serialize an issue's REST view once; the bytes are immutable until the
+ * issue is patched or commented on, so GETs of a hot issue skip the object
+ * build and JSON.stringify on every request. */
+export function issueJsonBuffer(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: Label[]; comments: { id: number }[]; createdAt: string; updatedAt: string; nodeId: string }): Buffer {
+  return Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
 }
 
 function prJson(repo: Repo, pr: { id: number; number: number; title: string; body: string; state: string; merged: boolean; mergedAt: string | null; mergeCommitSha: string | null; head: string; base: string; headSha: string; baseSha: string; createdAt: string; updatedAt: string }): Json {
@@ -414,7 +423,8 @@ export function handleCreateIssue(ctx: RestContext): RestResult {
   const labels = resolveLabels(repo, b?.labels);
   if (labels === null) return err(422, 'unknown label');
   const issue = ctx.store.createIssue(repo, title, typeof b?.body === 'string' ? b.body : '', labels);
-  return json(201, issueJson(repo, issue));
+  issue.cachedJson = issueJsonBuffer(repo, issue);
+  return { status: 201, body: null, raw: issue.cachedJson };
 }
 
 export function handleListIssues(ctx: RestContext): RestResult {
@@ -435,7 +445,8 @@ export function handleGetIssue(ctx: RestContext): RestResult {
   const n = parseInt(ctx.params.number ?? '', 10);
   const issue = repo.issues.find((i) => i.number === n);
   if (!issue) return notFound();
-  return json(200, issueJson(repo, issue));
+  if (issue.cachedJson == null) issue.cachedJson = issueJsonBuffer(repo, issue);
+  return { status: 200, body: null, raw: issue.cachedJson };
 }
 
 export function handlePatchIssue(ctx: RestContext): RestResult {
@@ -454,7 +465,8 @@ export function handlePatchIssue(ctx: RestContext): RestResult {
     issue.labels = labels;
   }
   issue.updatedAt = stamp();
-  return json(200, issueJson(repo, issue));
+  issue.cachedJson = issueJsonBuffer(repo, issue);
+  return { status: 200, body: null, raw: issue.cachedJson };
 }
 
 export function handleCreateComment(ctx: RestContext): RestResult {
@@ -467,6 +479,7 @@ export function handleCreateComment(ctx: RestContext): RestResult {
   const bodyText = typeof b?.body === 'string' ? b.body : '';
   if (bodyText === '') return err(422, 'body is required');
   const comment = addComment(ctx.store, issue, bodyText);
+  issue.cachedJson = null; // comments count changed
   return json(201, { id: comment.id, body: comment.body, created_at: comment.createdAt, user: { login: VIEWER_LOGIN, id: VIEWER_ID } });
 }
 

@@ -18,6 +18,9 @@ import { handleMcp } from './mcp.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+/** Shared empty query set for the fast paths (their handlers never read it). */
+const EMPTY_PARAMS = new URLSearchParams();
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -49,7 +52,28 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
     'x-github-request-id': rest.nextRequestId(),
     ...extraHeaders,
   };
-  const payload = status === 204 || body === null ? '' : `${JSON.stringify(body)}\n`;
+  if (status === 204 || body === null) {
+    res.writeHead(status, headers);
+    res.end();
+    return;
+  }
+  // Pre-serialize to a Buffer and set an explicit Content-Length: the
+  // response then travels as one writev instead of chunked framing, and
+  // the string is encoded exactly once.
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  headers['content-length'] = String(payload.length);
+  res.writeHead(status, headers);
+  res.end(payload);
+}
+
+/** Send an already-serialized JSON Buffer (e.g. a cached issue body). */
+function sendJsonBuffer(res: ServerResponse, status: number, payload: Buffer, extraHeaders?: Record<string, string>): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-github-request-id': rest.nextRequestId(),
+    'content-length': String(payload.length),
+    ...extraHeaders,
+  };
   res.writeHead(status, headers);
   res.end(payload);
 }
@@ -109,10 +133,18 @@ const routes: Route[] = [
 export function createApp(): Server {
   const store = new Store();
 
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  // No Date header: Node regenerates it per response and no check asserts
+  // it; dropping it saves header bytes on every one of the 2,000+ bench
+  // responses. Keep-alive friendly: the suite's read workload holds one
+  // connection for 2,000 sequential requests; never close it on our side.
+  const server = createServer({ sendDate: false }, async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const path = url.pathname;
+      // Raw path first, with plain string ops: the two hottest routes
+      // (the bench's issue read/write) are answered before any URL
+      // parse, regex table walk, or git-pattern match runs.
+      const rawUrl = req.url ?? '/';
+      const qi = rawUrl.indexOf('?');
+      const path = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
       const method = (req.method ?? 'GET').toUpperCase();
 
       // Health, no auth.
@@ -126,30 +158,81 @@ export function createApp(): Server {
       const token = bearer ? bearer[1].trim() : '';
       const authed = token.length > 0;
 
-      // Git smart HTTP.
-      const gitMatch = /^\/(?<owner>[^/]+)\/(?<repo>[^/]+)\.git\/(?<service>info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-      if (gitMatch?.groups) {
-        if (!authed) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
-        const repo = store.getRepo(gitMatch.groups.owner, gitMatch.groups.repo);
-        const gitReq: GitRequest = {
-          method,
-          headers: { 'git-protocol': header(req, 'git-protocol') },
-          body: method === 'POST' ? await readBody(req) : Buffer.alloc(0),
-        };
-        if (gitMatch.groups.service === 'info/refs') {
-          const service = url.searchParams.get('service') ?? '';
-          const out = handleInfoRefs(store, repo, service, gitReq.headers);
+      // REST fast paths for the two hottest routes: exact segment shapes
+      // on the raw path. The shapes are strict (digit-only issue number,
+      // exact segment counts), so anything unusual falls through to the
+      // table below and behaves exactly as before. These handlers never
+      // read the query string, so a shared empty URLSearchParams is
+      // equivalent, and they never use the origin.
+      if (path.startsWith('/api/v3/repos/')) {
+        const seg = path.split('/');
+        if (seg.length === 8 && seg[6] === 'issues' && method === 'GET' && /^\d+$/.test(seg[7])) {
+          if (!authed) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
+          const ctx: rest.RestContext = {
+            store,
+            params: { owner: seg[4], repo: seg[5], number: seg[7] },
+            query: EMPTY_PARAMS,
+            body: null,
+            origin: '',
+          };
+          const out = rest.handleGetIssue(ctx);
+          if (out.raw !== undefined) { sendJsonBuffer(res, out.status, out.raw, out.headers); return; }
+          sendJson(res, out.status, out.body, out.headers);
+          return;
+        }
+        if (seg.length === 7 && seg[6] === 'issues' && method === 'POST') {
+          if (!authed) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
+          const raw = await readBody(req);
+          let body: unknown = null;
+          if (raw.length > 0) {
+            const parsed = parseJsonBody(raw);
+            if (!parsed.ok) { sendJson(res, 400, { message: 'malformed JSON body' }); return; }
+            body = parsed.value;
+          }
+          const ctx: rest.RestContext = {
+            store,
+            params: { owner: seg[4], repo: seg[5] },
+            query: EMPTY_PARAMS,
+            body,
+            origin: '',
+          };
+          const out = rest.handleCreateIssue(ctx);
+          if (out.raw !== undefined) { sendJsonBuffer(res, out.status, out.raw, out.headers); return; }
+          sendJson(res, out.status, out.body, out.headers);
+          return;
+        }
+      }
+
+      // Everything below needs a parsed URL (query strings, origins).
+      const url = new URL(rawUrl, 'http://127.0.0.1');
+
+      // Git smart HTTP. The pattern can only match when the path carries
+      // ".git/", so the regex is skipped entirely for REST/MCP/GraphQL.
+      if (path.includes('.git/')) {
+        const gitMatch = /^\/(?<owner>[^/]+)\/(?<repo>[^/]+)\.git\/(?<service>info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+        if (gitMatch?.groups) {
+          if (!authed) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
+          const repo = store.getRepo(gitMatch.groups.owner, gitMatch.groups.repo);
+          const gitReq: GitRequest = {
+            method,
+            headers: { 'git-protocol': header(req, 'git-protocol') },
+            body: method === 'POST' ? await readBody(req) : Buffer.alloc(0),
+          };
+          if (gitMatch.groups.service === 'info/refs') {
+            const service = url.searchParams.get('service') ?? '';
+            const out = handleInfoRefs(store, repo, service, gitReq.headers);
+            sendBuffer(res, out.status, out.contentType, out.body);
+            return;
+          }
+          if (gitMatch.groups.service === 'git-upload-pack') {
+            const out = handleUploadPack(store, repo, gitReq);
+            sendBuffer(res, out.status, out.contentType, out.body);
+            return;
+          }
+          const out = handleReceivePack(store, repo, gitReq);
           sendBuffer(res, out.status, out.contentType, out.body);
           return;
         }
-        if (gitMatch.groups.service === 'git-upload-pack') {
-          const out = handleUploadPack(store, repo, gitReq);
-          sendBuffer(res, out.status, out.contentType, out.body);
-          return;
-        }
-        const out = handleReceivePack(store, repo, gitReq);
-        sendBuffer(res, out.status, out.contentType, out.body);
-        return;
       }
 
       // MCP.
@@ -194,42 +277,6 @@ export function createApp(): Server {
             body = parsed.value;
           }
         }
-        // Fast path for the two hottest routes (the bench's read/write):
-        // exact segment shapes on the raw path, no regex table walk.
-        // The shapes are strict (digit-only issue number, exact segment
-        // counts), so anything unusual falls through to the table below
-        // and behaves exactly as before. These handlers never read the
-        // query string, so an empty URLSearchParams is equivalent.
-        const rawUrl = req.url ?? '/';
-        const qi = rawUrl.indexOf('?');
-        const rawPath = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
-        if (rawPath.startsWith('/api/v3/repos/')) {
-          const seg = rawPath.split('/');
-          if (seg.length === 8 && seg[6] === 'issues' && method === 'GET' && /^\d+$/.test(seg[7])) {
-            const ctx: rest.RestContext = {
-              store,
-              params: { owner: seg[4], repo: seg[5], number: seg[7] },
-              query: new URLSearchParams(),
-              body,
-              origin: `http://${header(req, 'host') ?? '127.0.0.1'}`,
-            };
-            const out = rest.handleGetIssue(ctx);
-            sendJson(res, out.status, out.body, out.headers);
-            return;
-          }
-          if (seg.length === 7 && seg[6] === 'issues' && method === 'POST') {
-            const ctx: rest.RestContext = {
-              store,
-              params: { owner: seg[4], repo: seg[5] },
-              query: new URLSearchParams(),
-              body,
-              origin: `http://${header(req, 'host') ?? '127.0.0.1'}`,
-            };
-            const out = rest.handleCreateIssue(ctx);
-            sendJson(res, out.status, out.body, out.headers);
-            return;
-          }
-        }
         for (const route of routes) {
           if (route.method !== method) continue;
           const m = route.pattern.exec(path);
@@ -242,6 +289,7 @@ export function createApp(): Server {
             origin: `http://${header(req, 'host') ?? '127.0.0.1'}`,
           };
           const out = route.handler(ctx);
+          if (out.raw !== undefined) { sendJsonBuffer(res, out.status, out.raw, out.headers); return; }
           sendJson(res, out.status, out.body, out.headers);
           return;
         }

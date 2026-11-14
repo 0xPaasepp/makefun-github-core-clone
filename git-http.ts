@@ -62,6 +62,28 @@ function fetchCachePut(key: string, buf: Buffer): void {
 const ADV_CACHE_MAX = 256;
 interface AdvEntry { fp: string; buf: Buffer; }
 const advCache = new Map<string, AdvEntry>();
+
+// ls-refs responses are pure given (refs, peel, symrefs, ref-prefixes):
+// a clone's ls-refs is identical for all 50 concurrent clones of one
+// repo, so cache them the same way as the advertisements. Skipped when
+// the repo holds tag refs (peeled lines depend on object presence).
+const LS_CACHE_MAX = 256;
+interface LsEntry { fp: string; buf: Buffer; }
+const lsCache = new Map<string, LsEntry>();
+function lsCacheGet(key: string, fp: string): Buffer | undefined {
+  const hit = lsCache.get(key);
+  if (hit !== undefined && hit.fp === fp) return hit.buf;
+  return undefined;
+}
+function lsCachePut(key: string, fp: string, buf: Buffer): void {
+  if (lsCache.has(key)) lsCache.delete(key);
+  lsCache.set(key, { fp, buf });
+  while (lsCache.size > LS_CACHE_MAX) {
+    const oldest = lsCache.keys().next();
+    if (oldest.done) break;
+    lsCache.delete(oldest.value);
+  }
+}
 function advFingerprint(repo: Repo): string | null {
   let hasTag = false;
   const parts: string[] = [repo.defaultBranch];
@@ -355,7 +377,15 @@ export function handleUploadPack(store: Store, repo: Repo | undefined, req: GitR
   if (isV2) {
     const { command, args } = splitV2Request(packets);
     if (command === 'ls-refs') {
-      return ok(lsRefsResponse(store, repo, args), 'application/x-git-upload-pack-result');
+      const fp = advFingerprint(repo);
+      const key = `${repo.owner}/${repo.name}|ls|${args.join(',')}`;
+      if (fp !== null) {
+        const hit = lsCacheGet(key, fp);
+        if (hit !== undefined) return ok(hit, 'application/x-git-upload-pack-result');
+      }
+      const buf = lsRefsResponse(store, repo, args);
+      if (fp !== null) lsCachePut(key, fp, buf);
+      return ok(buf, 'application/x-git-upload-pack-result');
     }
     if (command === 'fetch') {
       return ok(fetchResponseV2(store, repo, parseFetchArgsV2(args)), 'application/x-git-upload-pack-result');

@@ -62,6 +62,8 @@ export interface Issue {
   createdAt: string; updatedAt: string; createdSeq: number;
   /** Precomputed REST node_id (base64url of "I:<owner>/<repo>:<number>"); immutable. */
   nodeId: string;
+  /** Cached serialized REST view (issueJsonBuffer); null when stale. */
+  cachedJson?: Buffer | null;
 }
 export interface PullRequest {
   id: number; number: number; title: string; body: string;
@@ -338,12 +340,13 @@ export class Store {
   createIssue(repo: Repo, title: string, body: string, labels: Label[]): Issue {
     const n = nextSeq();
     const number = repo.nextNumber++;
+    const at = stamp(n);
     const issue: Issue = {
       id: this.nextIssueId++,
       number,
       title, body: body ?? '',
       state: 'open', labels, comments: [],
-      createdAt: stamp(n), updatedAt: stamp(n), createdSeq: n,
+      createdAt: at, updatedAt: at, createdSeq: n,
       nodeId: Buffer.from(`I:${repo.owner}/${repo.name}:${number}`, 'utf8').toString('base64url'),
     };
     repo.issues.push(issue);

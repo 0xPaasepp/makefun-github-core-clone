@@ -610,6 +610,7 @@ function executeMutation(ctx: ExecContext, field: FieldNode): Record<string, unk
       if (!found) return null;
       found.issue.state = 'closed';
       found.issue.updatedAt = stamp();
+      found.issue.cachedJson = null; // REST view cache is stale now
       return executeSelections(ctx, 'CloseIssuePayload', null, field.selections, (f) =>
         f.name === 'issue' ? issueValue(ctx, found.repo, found.issue, f.selections) : null);
     }
@@ -646,6 +647,7 @@ function executeMutation(ctx: ExecContext, field: FieldNode): Record<string, unk
       const id = ctx.store.nextCommentId();
       const comment = { id, body, createdAt: stamp() };
       found.issue.comments.push(comment);
+      found.issue.cachedJson = null; // comments count changed
       return executeSelections(ctx, 'AddCommentPayload', null, field.selections, (f) => {
         if (f.name !== 'commentEdge') return null;
         return executeSelections(ctx, 'CommentEdge', null, f.selections, (ef) => {
